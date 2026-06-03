@@ -1,3 +1,4 @@
+using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
 using Agent.Contracts;
@@ -31,24 +32,91 @@ public sealed class LearnMcpClient(HttpClient httpClient, IOptions<LearnMcpOptio
             }
         };
 
-        using var request = new HttpRequestMessage(HttpMethod.Post, _options.Endpoint)
-        {
-            Content = new StringContent(JsonSerializer.Serialize(payload, AgentJson.Default), Encoding.UTF8, "application/json")
-        };
+        using var request = CreateRequest(payload);
 
         using var response = await httpClient.SendAsync(request, cancellationToken);
-        response.EnsureSuccessStatusCode();
-
         var body = await response.Content.ReadAsStringAsync(cancellationToken);
+
+        if (!response.IsSuccessStatusCode)
+        {
+            var errorBody = string.IsNullOrWhiteSpace(body)
+                ? "<empty>"
+                : body.Length <= 500 ? body : $"{body[..500]}...";
+
+            throw new HttpRequestException(
+                $"Request to '{_options.Endpoint}' failed with status code {(int)response.StatusCode} ({response.ReasonPhrase}). Response body: {errorBody}",
+                null,
+                response.StatusCode);
+        }
+
         if (string.IsNullOrWhiteSpace(body))
         {
             return new MicrosoftLearnResponse(string.Empty);
         }
 
+        body = NormalizeResponseBody(body, response.Content.Headers.ContentType?.MediaType);
+
         using var document = JsonDocument.Parse(body);
         var answer = TryExtractAnswer(document.RootElement);
 
         return new MicrosoftLearnResponse(answer);
+    }
+
+    private HttpRequestMessage CreateRequest(object payload)
+    {
+        var request = new HttpRequestMessage(HttpMethod.Post, _options.Endpoint)
+        {
+            Content = new StringContent(JsonSerializer.Serialize(payload, AgentJson.Default), Encoding.UTF8, "application/json")
+        };
+
+        request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+        request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("text/event-stream"));
+
+        return request;
+    }
+
+    private static string NormalizeResponseBody(string body, string? mediaType)
+    {
+        if (string.Equals(mediaType, "text/event-stream", StringComparison.OrdinalIgnoreCase)
+            || body.StartsWith("event:", StringComparison.OrdinalIgnoreCase)
+            || body.StartsWith("data:", StringComparison.OrdinalIgnoreCase))
+        {
+            body = ExtractJsonFromSse(body);
+        }
+
+        if (body.StartsWith("{", StringComparison.Ordinal) || body.StartsWith("[", StringComparison.Ordinal))
+        {
+            return body;
+        }
+
+        var preview = body.Length <= 500 ? body : $"{body[..500]}...";
+        throw new JsonException($"Expected JSON response from '{nameof(LearnMcpClient)}' but received non-JSON content. Body: {preview}");
+    }
+
+    private static string ExtractJsonFromSse(string body)
+    {
+        using var reader = new StringReader(body);
+        string? line;
+        while ((line = reader.ReadLine()) is not null)
+        {
+            if (!line.StartsWith("data:", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            var payload = line["data:".Length..].Trim();
+            if (string.IsNullOrWhiteSpace(payload) || string.Equals(payload, "[DONE]", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            if (payload.StartsWith("{", StringComparison.Ordinal) || payload.StartsWith("[", StringComparison.Ordinal))
+            {
+                return payload;
+            }
+        }
+
+        return body;
     }
 
     private static string TryExtractAnswer(JsonElement root)
